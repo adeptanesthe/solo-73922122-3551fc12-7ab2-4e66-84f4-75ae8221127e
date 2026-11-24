@@ -30,6 +30,14 @@ import threading
 from fractions import Fraction
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
+from .audit import (
+    AuditConflict,
+    AuditIncomplete,
+    AuditOrder,
+    ScoreBucket,
+    evaluate_audit,
+    new_order,
+)
 from .calibration import Calibration, CalibrationMissing, build_calibration
 
 MAX_PANELS = 50_000
@@ -79,6 +87,12 @@ class PanelStore:
         self._id_heaps: List[List[int]] = [[] for _ in range(SCORE_COUNT)]
         # Ids still pending in each bucket; heap entries outside it are stale.
         self._live: List[Set[int]] = [set() for _ in range(SCORE_COUNT)]
+        # Per-score pending-population sizes, kept in sync with the lazy deletes
+        # so audit aggregation only reads 256 counters, never the panel dict.
+        self._pending_by_score: List[int] = [0] * SCORE_COUNT
+        # Current audit order; replaced atomically when a new one is created.
+        self._audit_order: Optional[AuditOrder] = None
+        self._audit_seq = 0
         # Instrumentation: pending-heap entries examined by queue selection.
         # Tests use it to prove selection never scans the pending population.
         self.stats = {"heap_entries_popped": 0, "heap_entries_dropped": 0}
@@ -155,6 +169,7 @@ class PanelStore:
                 heapq.heappush(self._loss_heaps[score], (-loss, panel_id))
                 heapq.heappush(self._id_heaps[score], panel_id)
                 self._live[score].add(panel_id)
+                self._pending_by_score[score] += 1
             else:
                 panel.inspected = result
                 self._add_count(score, result)
@@ -189,6 +204,7 @@ class PanelStore:
             # Lazy delete: drop the id from the live set.  Stale heap entries
             # are skipped if they ever surface at a heap top.
             self._live[panel.score].discard(panel_id)
+            self._pending_by_score[panel.score] -= 1
             panel.inspected = result
             self._add_count(panel.score, result)
         self._refit()
@@ -319,3 +335,66 @@ class PanelStore:
                 (panel_id, rate, expected)
                 for panel_id, _score, rate, expected in self._ranked(k)
             ]
+
+    # ------------------------------------------------------------- audits
+    @property
+    def audit_order(self) -> Optional[AuditOrder]:
+        return self._audit_order
+
+    def create_audit_order(self, min_defects: int, max_defects: int) -> AuditOrder:
+        """Create an audit order from the registered panel list and interval.
+
+        The new order replaces the current one atomically.  Inspection
+        corrections recorded afterwards feed the next query automatically --
+        the order itself is immutable.
+        """
+        with self._lock:
+            self._audit_seq += 1
+            order = new_order(
+                f"audit-{self._audit_seq}",
+                min_defects,
+                max_defects,
+                panels=self.total_panels,
+                inspected=self.inspected_panels,
+                pending=self.pending_panels,
+            )
+            self._audit_order = order
+            return order
+
+    def _score_buckets(self) -> List[ScoreBucket]:
+        """Aggregate counts per score in O(256); no panel is enumerated."""
+        buckets: List[ScoreBucket] = []
+        for score in range(SCORE_COUNT):
+            positives, inspected_total = self._counts.get(score, (0, 0))
+            pending = self._pending_by_score[score]
+            good = inspected_total - positives
+            total = inspected_total + pending
+            if total == 0:
+                continue
+            buckets.append(
+                ScoreBucket(
+                    score=score,
+                    total=total,
+                    inspected_defects=positives,
+                    inspected_good=good,
+                    pending=pending,
+                )
+            )
+        return buckets
+
+    def audit_snapshot(self, order_id: Optional[str] = None):
+        """Re-evaluate the current order against the latest inspection state.
+
+        Returns an :class:`AuditEvaluation`, or raises :class:`AuditConflict`
+        / :class:`AuditIncomplete` (the order stays queryable after a
+        correction resolves the situation).
+        """
+        with self._lock:
+            if self._audit_order is None:
+                raise NotFound("no audit order has been created")
+            if order_id is not None and order_id != self._audit_order.order_id:
+                raise NotFound(
+                    f"audit order {order_id} is not the current order "
+                    f"(current: {self._audit_order.order_id})"
+                )
+            return evaluate_audit(self._score_buckets(), self._audit_order)
